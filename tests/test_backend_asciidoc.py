@@ -327,6 +327,57 @@ def test_block_attributes_and_anchors_are_not_emitted_as_text() -> None:
     assert [item.text for item in doc.texts] == ["This is a caveat."]
 
 
+def test_attribute_references_are_replaced() -> None:
+    # "{name}" references used to stay in the text as they were written, and
+    # the entries that unset an attribute (":name!:", ":!name:") were body text.
+    src = b"""= {product} Guide
+:product: Widget
+:Version: 2.4
+:full-name: {product} {version}
+
+Welcome to {full-name}. Unknown {missing} and escaped \\{product} stay.
+C{plus}{plus} and a{nbsp}b{empty}.
+
+* About {product}
+
+|===
+|Name |Version
+|{product} |{version}
+|===
+
+----
+code keeps {product}
+----
+
+:version!:
+:!product:
+After the unset: {version} and {product}.
+"""
+    in_doc = InputDocument(
+        path_or_stream=BytesIO(src),
+        format=InputFormat.ASCIIDOC,
+        backend=AsciiDocBackend,
+        filename="attribute-references.adoc",
+    )
+    doc = in_doc._backend.convert()
+
+    texts = [item.text for item in doc.texts]
+    assert texts == [
+        "Widget Guide",
+        "Welcome to Widget 2.4. Unknown {missing} and escaped {product} stay."
+        " C++ and a\u00a0b.",
+        "About Widget",
+        "code keeps {product}",
+        "After the unset: {version} and {product}.",
+    ]
+    assert [cell.text for cell in doc.tables[0].data.table_cells] == [
+        "Name",
+        "Version",
+        "Widget",
+        "2.4",
+    ]
+
+
 def test_unclosed_table_at_end_keeps_caption() -> None:
     src = b".End table\n|===\n|A |B"
     in_doc = InputDocument(

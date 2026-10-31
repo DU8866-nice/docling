@@ -42,6 +42,41 @@ _log = logging.getLogger(__name__)
 _LINE_COMMENT_RE = re.compile(r"^//(?!/)")
 _COMMENT_BLOCK_DELIMITER_RE = re.compile(r"/{4,}")
 
+# An attribute entry, e.g. ":version: 2.4". ":name!:" and ":!name:" unset the
+# attribute.
+_ATTRIBUTE_ENTRY_RE: Final = re.compile(
+    r"^:(?P<unset_before>!)?(?P<name>[\w.-]+?)(?P<unset_after>!)?:(?:\s+(?P<value>.*))?$"
+)
+# An attribute reference, e.g. "{version}". A backslash before it escapes it.
+_ATTRIBUTE_REFERENCE_RE: Final = re.compile(r"(\\)?\{(\w+(?:-\w+)*)\}")
+# The character replacement attributes that Asciidoctor predefines, with plain
+# text as value. References are replaced before a line is parsed, so the ones
+# whose value is AsciiDoc markup ({asterisk}, {vbar}, {startsb}, ...) are not
+# in this list: their value would act as markup.
+_PREDEFINED_ATTRIBUTES: Final[dict[str, str]] = {
+    "blank": "",
+    "empty": "",
+    "sp": " ",
+    "nbsp": "\u00a0",
+    "zwsp": "\u200b",
+    "wj": "\u2060",
+    "apos": "'",
+    "quot": '"',
+    "lsquo": "\u2018",
+    "rsquo": "\u2019",
+    "ldquo": "\u201c",
+    "rdquo": "\u201d",
+    "deg": "\u00b0",
+    "plus": "+",
+    "brvbar": "\u00a6",
+    "amp": "&",
+    "lt": "<",
+    "gt": ">",
+    "pp": "++",
+    "cpp": "C++",
+    "cxx": "C++",
+}
+
 # Cell format specifier that may precede a "|" delimiter, e.g. "^.^h" in
 # "^.^h|Header": span (3*, 2+, .2+, 2.3+), alignment (<, ^, >, .^), style
 # (a/d/e/h/l/m/s). AsciiDoc writes the span as [colspan][.rowspan] followed by
@@ -235,6 +270,10 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
             parents[i] = None
             indents[i] = None
 
+        # The document attributes for "{name}" references. The header sets
+        # them before the document title is read.
+        attributes = self._header_attributes(self.lines)
+
         for block in self._iter_blocks(self.lines):
             if not isinstance(block, str):
                 text_data, caption_data, in_list, last_list_item, list_continuation = (
@@ -251,7 +290,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                 )
                 continue
 
-            line = block
+            line = self._substitute_attributes(block, attributes)
             stripped_line = line.strip()
             if in_delimited_table and self._continue_table(table_data, line):
                 continue
@@ -265,13 +304,17 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                 is_continuation_block=False,
             )
 
+            # An attribute entry sets or unsets an attribute for the lines that
+            # follow. It is never body content.
+            if (entry := _ATTRIBUTE_ENTRY_RE.match(stripped_line)) is not None:
+                self._set_attribute(attributes, entry)
+                continue
+
             # Block attributes and anchors (e.g. "[cols=\"2,1\"]", "[NOTE]",
             # "[[some-id]]") are metadata that applies to the block that
             # follows; they are never body content, so skip them.
-            if (
-                re.match(r"^\[\[.+\]\]$", stripped_line)
-                or re.match(r"^\[[^\[\]]+\]$", stripped_line)
-                or re.match(r"^:[\w.-]+:(\s.*)?$", stripped_line)
+            if re.match(r"^\[\[.+\]\]$", stripped_line) or re.match(
+                r"^\[[^\[\]]+\]$", stripped_line
             ):
                 continue
 
@@ -461,6 +504,64 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
             )
 
         return doc
+
+    @classmethod
+    def _header_attributes(cls, lines: list[str]) -> dict[str, str]:
+        """Collect the attributes set in the document header.
+
+        The header is the document title and the lines after it, up to the
+        first blank line. Asciidoctor applies its attribute entries to the
+        whole document, so also to the title above them.
+        """
+        attributes: dict[str, str] = {}
+        in_header = False
+        for line in lines:
+            stripped = line.strip()
+            if not in_header:
+                if not stripped or cls._is_line_comment(line):
+                    continue
+                if not cls._is_title(line):
+                    break
+                in_header = True
+            elif not stripped:
+                break
+            else:
+                # A value can refer to the attributes set before it.
+                line_value = cls._substitute_attributes(stripped, attributes)
+                if (entry := _ATTRIBUTE_ENTRY_RE.match(line_value)) is not None:
+                    cls._set_attribute(attributes, entry)
+        return attributes
+
+    @staticmethod
+    def _set_attribute(attributes: dict[str, str], entry: re.Match[str]) -> None:
+        """Set or unset the attribute of an attribute entry.
+
+        Attribute names are case-insensitive, as in Asciidoctor.
+        """
+        name = entry.group("name").lower()
+        if entry.group("unset_before") or entry.group("unset_after"):
+            attributes.pop(name, None)
+        else:
+            attributes[name] = (entry.group("value") or "").strip()
+
+    @staticmethod
+    def _substitute_attributes(text: str, attributes: dict[str, str]) -> str:
+        """Replace the attribute references in `text` with their values.
+
+        A reference to an attribute that is not set stays as it is, as in
+        Asciidoctor. An escaped reference ("\\{name}") stays without the
+        backslash.
+        """
+
+        def replace(match: re.Match[str]) -> str:
+            if match.group(1):
+                return match.group(0)[1:]
+            name = match.group(2).lower()
+            if name in attributes:
+                return attributes[name]
+            return _PREDEFINED_ATTRIBUTES.get(name, match.group(0))
+
+        return _ATTRIBUTE_REFERENCE_RE.sub(replace, text)
 
     @staticmethod
     def _get_current_level(parents):
